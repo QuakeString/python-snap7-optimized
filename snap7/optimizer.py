@@ -194,32 +194,73 @@ def packetize(blocks: List[ReadBlock], pdu_size: int) -> List[ReadPacket]:
 
 
 def _split_block(block: ReadBlock, max_byte_request: int) -> List[ReadBlock]:
-    """Split an oversized block into smaller blocks that fit *max_byte_request*."""
-    result: List[ReadBlock] = []
-    offset = block.start_offset
-    remaining = block.byte_length
+    """Split an oversized block into smaller blocks that fit *max_byte_request*.
 
-    while remaining > 0:
-        chunk_size = min(remaining, max_byte_request)
-        chunk_end = offset + chunk_size
+    Split boundaries are chosen so that no individual item is torn across
+    two chunks.  When an item would straddle a boundary, the chunk is
+    extended to include it fully (up to the item's end), or — if the item
+    itself exceeds *max_byte_request* — it gets its own chunk.
+    """
+    if not block.items:
+        # No items — split purely by size (raw byte range)
+        result: List[ReadBlock] = []
+        offset = block.start_offset
+        remaining = block.byte_length
+        while remaining > 0:
+            chunk_size = min(remaining, max_byte_request)
+            result.append(
+                ReadBlock(
+                    area=block.area,
+                    db_number=block.db_number,
+                    start_offset=offset,
+                    byte_length=chunk_size,
+                    items=[],
+                )
+            )
+            offset += chunk_size
+            remaining -= chunk_size
+        return result
 
-        # Gather items that fall within this chunk
-        chunk_items = [
-            item for item in block.items if item.byte_offset < chunk_end and item.byte_offset + item.byte_length > offset
-        ]
+    # Sort items by byte_offset for sequential assignment
+    sorted_items = sorted(block.items, key=lambda it: it.byte_offset)
 
+    result = []
+    chunk_start = block.start_offset
+    chunk_end = chunk_start  # grows as items are added
+    chunk_items: List[ReadItem] = []
+
+    for item in sorted_items:
+        item_end = item.byte_offset + item.byte_length
+
+        if chunk_items and (item_end - chunk_start) > max_byte_request:
+            # Adding this item would overflow — flush current chunk
+            result.append(
+                ReadBlock(
+                    area=block.area,
+                    db_number=block.db_number,
+                    start_offset=chunk_start,
+                    byte_length=chunk_end - chunk_start,
+                    items=chunk_items,
+                )
+            )
+            chunk_start = item.byte_offset
+            chunk_end = chunk_start
+            chunk_items = []
+
+        chunk_items.append(item)
+        chunk_end = max(chunk_end, item_end)
+
+    # Flush last chunk
+    if chunk_items:
         result.append(
             ReadBlock(
                 area=block.area,
                 db_number=block.db_number,
-                start_offset=offset,
-                byte_length=chunk_size,
+                start_offset=chunk_start,
+                byte_length=chunk_end - chunk_start,
                 items=chunk_items,
             )
         )
-
-        offset += chunk_size
-        remaining -= chunk_size
 
     return result
 

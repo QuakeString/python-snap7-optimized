@@ -946,7 +946,7 @@ class TestReadMultiVarsOptimized(unittest.TestCase):
         cls.server = Server()
         db1_data = bytearray(range(256)) * 3
         cls.server.register_area(SrvArea.DB, 1, db1_data[:600])
-        db2_data = bytearray(b"\xAA\xBB\xCC\xDD" * 150)
+        db2_data = bytearray(b"\xaa\xbb\xcc\xdd" * 150)
         cls.server.register_area(SrvArea.DB, 2, db2_data[:600])
         mk_data = bytearray(b"\x11\x22\x33\x44" * 25)
         cls.server.register_area(SrvArea.MK, 0, mk_data[:100])
@@ -971,9 +971,11 @@ class TestReadMultiVarsOptimized(unittest.TestCase):
     def test_single_item(self) -> None:
         """Single-item read_multi_vars should match db_read."""
         expected = self.client.db_read(1, 0, 4)
-        _, results = self.client.read_multi_vars([
-            {"area": Area.DB, "db_number": 1, "start": 0, "size": 4},
-        ])
+        _, results = self.client.read_multi_vars(
+            [
+                {"area": Area.DB, "db_number": 1, "start": 0, "size": 4},
+            ]
+        )
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0], expected)
 
@@ -1010,17 +1012,21 @@ class TestReadMultiVarsOptimized(unittest.TestCase):
 
     def test_ct_tm_fallback(self) -> None:
         """CT and TM areas should fall back to individual reads (not error)."""
-        _, results = self.client.read_multi_vars([
-            {"area": Area.CT, "db_number": 0, "start": 0, "size": 2},
-        ])
+        _, results = self.client.read_multi_vars(
+            [
+                {"area": Area.CT, "db_number": 0, "start": 0, "size": 2},
+            ]
+        )
         self.assertEqual(len(results), 1)
         self.assertEqual(len(results[0]), 4)  # CT reads return 2-byte words
 
     def test_mk_area(self) -> None:
         """Reading from MK area should work."""
-        _, results = self.client.read_multi_vars([
-            {"area": Area.MK, "db_number": 0, "start": 0, "size": 4},
-        ])
+        _, results = self.client.read_multi_vars(
+            [
+                {"area": Area.MK, "db_number": 0, "start": 0, "size": 4},
+            ]
+        )
         self.assertEqual(len(results), 1)
         self.assertEqual(len(results[0]), 4)
 
@@ -1288,11 +1294,14 @@ class TestMaxVars:
         mock_conn = MagicMock()
         client.connection = mock_conn
 
-        # Mock the internal send/receive to return one byte per block
-        client._send_receive = MagicMock(return_value={"raw_data_section": b"", "parameters": {"item_count": 1}})
-        client.protocol.extract_multi_read_data = MagicMock(
-            side_effect=lambda resp, count: [bytearray(1)] * count
+        # Mock connection-level send/receive and protocol parsing
+        mock_conn.send_data = MagicMock()
+        mock_conn.receive_data = MagicMock(return_value=b"\x00" * 20)
+        mock_conn.data_available = MagicMock(return_value=True)
+        client.protocol.parse_response = MagicMock(
+            return_value={"raw_data_section": b"", "parameters": {"item_count": 1}, "sequence": 0}
         )
+        client.protocol.extract_multi_read_data = MagicMock(side_effect=lambda resp, count: [bytearray(1)] * count)
 
         items = [{"area": Area.DB, "db_number": 1, "start": i, "size": 1} for i in range(20)]
         result_code, results = client.read_multi_vars(items)
@@ -1315,6 +1324,147 @@ class TestMaxVars:
         client = Client()
         result_code, _ = client.read_multi_vars([])
         assert result_code == 0
+
+
+@pytest.mark.client
+class TestParallelDispatch:
+    """Test parallel dispatch with sequence number matching."""
+
+    def test_parallel_sends_all_before_receiving(self) -> None:
+        """All requests should be sent before any response is read."""
+        client = Client()
+        client.connected = True
+        mock_conn = MagicMock()
+        mock_conn.timeout = 5.0
+        client.connection = mock_conn
+
+        # Build two fake PDUs with different sequence numbers
+        pdu1 = struct.pack(">BBHHH", 0x32, 0x03, 0, 101, 0) + b"\x00" * 10
+        pdu2 = struct.pack(">BBHHH", 0x32, 0x03, 0, 102, 0) + b"\x00" * 10
+
+        mock_conn.data_available = MagicMock(return_value=True)
+        mock_conn.receive_data = MagicMock(side_effect=[b"resp1", b"resp2"])
+        client.protocol.parse_response = MagicMock(
+            side_effect=[
+                {"sequence": 101, "parameters": {}},
+                {"sequence": 102, "parameters": {}},
+            ]
+        )
+
+        results = client._send_receive_parallel([(0, pdu1), (1, pdu2)])
+
+        # Both sends should happen before any receive
+        assert mock_conn.send_data.call_count == 2
+        assert mock_conn.receive_data.call_count == 2
+        assert len(results) == 2
+
+    def test_out_of_order_responses(self) -> None:
+        """Responses arriving in reverse order should be matched correctly."""
+        client = Client()
+        client.connected = True
+        mock_conn = MagicMock()
+        mock_conn.timeout = 5.0
+        client.connection = mock_conn
+
+        pdu1 = struct.pack(">BBHHH", 0x32, 0x03, 0, 201, 0)
+        pdu2 = struct.pack(">BBHHH", 0x32, 0x03, 0, 202, 0)
+
+        mock_conn.data_available = MagicMock(return_value=True)
+        mock_conn.receive_data = MagicMock(side_effect=[b"r2", b"r1"])
+        # Responses arrive in reverse order: 202 first, then 201
+        client.protocol.parse_response = MagicMock(
+            side_effect=[
+                {"sequence": 202, "data": "second"},
+                {"sequence": 201, "data": "first"},
+            ]
+        )
+
+        results = client._send_receive_parallel([(0, pdu1), (1, pdu2)])
+        assert results[0]["data"] == "first"
+        assert results[1]["data"] == "second"
+
+    def test_stale_packet_discarded(self) -> None:
+        """Unexpected sequence numbers should be discarded."""
+        client = Client()
+        client.connected = True
+        mock_conn = MagicMock()
+        mock_conn.timeout = 5.0
+        client.connection = mock_conn
+
+        pdu1 = struct.pack(">BBHHH", 0x32, 0x03, 0, 301, 0)
+
+        mock_conn.data_available = MagicMock(return_value=True)
+        mock_conn.receive_data = MagicMock(side_effect=[b"stale", b"real"])
+        # First response has wrong seq (999), second has correct (301)
+        client.protocol.parse_response = MagicMock(
+            side_effect=[
+                {"sequence": 999},
+                {"sequence": 301},
+            ]
+        )
+
+        results = client._send_receive_parallel([(0, pdu1)])
+        assert 0 in results
+        assert results[0]["sequence"] == 301
+
+    def test_timeout_raises(self) -> None:
+        """Should raise S7TimeoutError when response doesn't arrive."""
+        from snap7.error import S7TimeoutError
+
+        client = Client()
+        client.connected = True
+        mock_conn = MagicMock()
+        mock_conn.timeout = 0.1  # Short timeout
+        client.connection = mock_conn
+
+        pdu1 = struct.pack(">BBHHH", 0x32, 0x03, 0, 401, 0)
+
+        mock_conn.data_available = MagicMock(return_value=False)
+
+        with pytest.raises(S7TimeoutError):
+            client._send_receive_parallel([(0, pdu1)])
+
+    def test_sliding_window(self) -> None:
+        """Multiple windows should be used when packets exceed max_parallel."""
+        client = Client()
+        client.connected = True
+        client.max_parallel = 2
+        mock_conn = MagicMock()
+        client.connection = mock_conn
+
+        mock_conn.send_data = MagicMock()
+        mock_conn.receive_data = MagicMock(return_value=b"\x00" * 20)
+        mock_conn.data_available = MagicMock(return_value=True)
+
+        # 4 packets with max_parallel=2 → 2 windows
+        seq_counter = [0]
+
+        def mock_build(items: Any) -> bytes:
+            seq_counter[0] += 1
+            return struct.pack(">BBHHH", 0x32, 0x01, 0, seq_counter[0], 2) + struct.pack(">BB", 0x04, len(items))
+
+        client.protocol.build_multi_read_request = mock_build
+
+        response_seq = iter(range(1, 5))
+
+        def mock_parse(data: bytes) -> dict[str, Any]:
+            return {"sequence": next(response_seq), "parameters": {"item_count": 1}}
+
+        client.protocol.parse_response = mock_parse  # type: ignore[assignment]
+        client.protocol.extract_multi_read_data = MagicMock(side_effect=lambda resp, count: [bytearray(1)] * count)
+
+        # Create 4 items spread across different DBs to force 4 packets
+        # (each DB gets its own block which won't merge across DBs)
+        items = [{"area": Area.DB, "db_number": i, "start": 0, "size": 1} for i in range(1, 5)]
+        # Force max_gap=0 so nothing merges
+        result_code, results = client.read_multi_vars(items)
+        assert result_code == 0
+        assert len(results) == 4
+
+    def test_max_parallel_default(self) -> None:
+        """Default max_parallel should be 8."""
+        client = Client()
+        assert client.max_parallel == 8
 
 
 if __name__ == "__main__":

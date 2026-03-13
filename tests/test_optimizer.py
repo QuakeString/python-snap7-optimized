@@ -245,6 +245,34 @@ class TestPacketize:
         total_bytes = sum(b.byte_length for p in packets for b in p.blocks)
         assert total_bytes == 500
 
+    def test_block_splitting_preserves_items(self) -> None:
+        """Items must never be torn across split boundaries."""
+        # PDU 240 → max_byte_request = 220
+        # Create a block with items that would straddle a naive 220-byte boundary
+        items = [
+            _item(offset=0, length=4, index=0),  # DWORD at 0
+            _item(offset=216, length=8, index=1),  # LREAL at 216 — ends at 224, crosses 220
+            _item(offset=300, length=4, index=2),  # DWORD at 300
+        ]
+        big_block = ReadBlock(
+            area=Area.DB,
+            db_number=1,
+            start_offset=0,
+            byte_length=304,
+            items=items,
+        )
+        packets = packetize([big_block], pdu_size=240)
+        # Every item must appear in exactly one block, fully contained
+        for packet in packets:
+            for block in packet.blocks:
+                for item in block.items:
+                    assert item.byte_offset >= block.start_offset
+                    assert item.byte_offset + item.byte_length <= block.start_offset + block.byte_length
+
+        # All items accounted for
+        all_items = [item for p in packets for b in p.blocks for item in b.items]
+        assert sorted(it.index for it in all_items) == [0, 1, 2]
+
     def test_pdu_240_budget(self) -> None:
         assert _max_byte_request(240) == 4 * ((240 - 18) // 4)
 

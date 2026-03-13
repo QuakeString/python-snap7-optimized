@@ -18,7 +18,7 @@ from ctypes import (
 from .connection import ISOTCPConnection
 from .s7protocol import S7Protocol, get_return_code_description
 from .datatypes import S7Area, S7WordLen
-from .error import S7Error, S7ConnectionError, S7ProtocolError, S7StalePacketError
+from .error import S7Error, S7ConnectionError, S7ProtocolError, S7StalePacketError, S7TimeoutError
 from .optimizer import ReadItem, ReadBlock, optimize_reads, extract_results
 
 from .type import (
@@ -100,6 +100,16 @@ class Client:
             Parameter.PDURequest: 480,
         }
 
+        # Parallel dispatch config
+        self.max_parallel = 8  # Max packets in-flight for parallel dispatch
+
+        # Optimization plan cache (reused when the same item list is polled repeatedly)
+        self._opt_cache_key: Optional[tuple[tuple[int, int, int, int], ...]] = None
+        self._opt_cache_packets: Optional[List[Any]] = None
+        self._opt_cache_read_items: Optional[List[Any]] = None
+        self._opt_cache_optimizable: Optional[List[Tuple[int, dict[str, Any]]]] = None
+        self._opt_cache_fallback: Optional[List[Tuple[int, dict[str, Any]]]] = None
+
         # Async operation state
         self._async_pending = False
         self._async_result: Optional[bytearray] = None
@@ -150,6 +160,98 @@ class Client:
 
         raise S7ProtocolError("Failed to receive valid response")  # Should not reach here
 
+    def _send_receive_parallel(
+        self,
+        requests: List[Tuple[int, bytes]],
+    ) -> dict[int, dict[str, Any]]:
+        """Send multiple requests and collect responses matched by sequence number.
+
+        Fires all PDUs back-to-back on the single TCP connection, then uses
+        ``select()`` to read responses as they arrive.  Each response is
+        matched to its originating request via the S7 sequence number
+        embedded at header bytes 4-5.
+
+        Args:
+            requests: ``(packet_index, pdu_bytes)`` pairs.
+
+        Returns:
+            Dict mapping *packet_index* to the parsed response dict.
+        """
+        conn = self._get_connection()
+
+        # Build seq_num -> packet_index lookup
+        pending: dict[int, int] = {}
+        for packet_index, pdu in requests:
+            seq = struct.unpack(">H", pdu[4:6])[0]
+            pending[seq] = packet_index
+
+        # Send all requests back-to-back
+        for _, pdu in requests:
+            conn.send_data(pdu)
+
+        # Receive responses, matching by sequence number
+        results: dict[int, dict[str, Any]] = {}
+        remaining = len(requests)
+        deadline = time.monotonic() + conn.timeout
+
+        while remaining > 0:
+            wait_time = deadline - time.monotonic()
+            if wait_time <= 0:
+                raise S7TimeoutError(f"Timeout waiting for {remaining} parallel response(s)")
+
+            if not conn.data_available(timeout=wait_time):
+                raise S7TimeoutError(f"Timeout waiting for {remaining} parallel response(s)")
+
+            response_data = conn.receive_data()
+            response = self.protocol.parse_response(response_data)
+            resp_seq = response["sequence"]
+
+            if resp_seq in pending:
+                packet_index = pending.pop(resp_seq)
+                results[packet_index] = response
+                remaining -= 1
+            else:
+                logger.warning(f"Discarding unexpected response with sequence {resp_seq}")
+
+        return results
+
+    # Mapping of PDU size ranges to sensible max_parallel defaults.
+    # Smaller PDUs indicate older/smaller PLCs with fewer resources.
+    _PDU_PARALLEL_MAP = [
+        (960, 8),  # S7-1500, S7-1200 high — full parallelism
+        (480, 6),  # S7-400, S7-1200 default
+        (240, 2),  # S7-300, LOGO, S7-200 — conservative
+    ]
+
+    def _auto_tune_parallel(self) -> None:
+        """Set *max_parallel* based on negotiated PDU size and PLC capabilities.
+
+        Tries ``get_cp_info()`` first to read the PLC's reported
+        ``MaxConnections``.  If that fails (LOGO, S7-200, some FW versions),
+        falls back to a PDU-size-based heuristic.
+        """
+        try:
+            cp_info = self.get_cp_info()
+            max_conn = cp_info.MaxConnections
+            if max_conn and max_conn > 0:
+                # Leave headroom: use at most half the PLC's connection
+                # slots for parallel reads (other clients may need slots).
+                self.max_parallel = max(1, min(max_conn // 2, 8))
+                logger.debug(f"Auto-tuned max_parallel={self.max_parallel} (PLC MaxConnections={max_conn})")
+                return
+        except Exception:
+            pass  # SZL not supported — fall back to PDU heuristic
+
+        # Fallback: infer from negotiated PDU size
+        for pdu_threshold, parallel in self._PDU_PARALLEL_MAP:
+            if self.pdu_length >= pdu_threshold:
+                self.max_parallel = parallel
+                break
+        else:
+            self.max_parallel = 1  # Very small PDU — sequential only
+
+        logger.debug(f"Auto-tuned max_parallel={self.max_parallel} (PDU={self.pdu_length})")
+
     def connect(self, address: str, rack: int, slot: int, tcp_port: int = 102) -> "Client":
         """
         Connect to S7 PLC.
@@ -187,6 +289,10 @@ class Client:
             self._setup_communication()
 
             self.connected = True
+
+            # Auto-tune max_parallel based on PLC capabilities
+            self._auto_tune_parallel()
+
             self._exec_time = int((time.time() - start_time) * 1000)
             logger.info(f"Connected to {address}:{tcp_port} rack {rack} slot {slot}")
 
@@ -472,10 +578,9 @@ class Client:
         # Handle S7DataItem array (ctypes)
         if hasattr(items, "_type_") and hasattr(items[0], "Area"):
             s7_items = cast("Array[S7DataItem]", items)
-            optimized_data = self._read_multi_optimized([
-                {"area": Area(si.Area), "db_number": si.DBNumber, "start": si.Start, "size": si.Amount}
-                for si in s7_items
-            ])
+            optimized_data = self._read_multi_optimized(
+                [{"area": Area(si.Area), "db_number": si.DBNumber, "start": si.Start, "size": si.Amount} for si in s7_items]
+            )
             for s7_item, data in zip(s7_items, optimized_data):
                 if s7_item.pData:
                     for i, b in enumerate(data):
@@ -487,52 +592,94 @@ class Client:
         results = self._read_multi_optimized(dict_items)
         return (0, results)
 
+    @staticmethod
+    def _items_cache_key(items: List[dict[str, Any]]) -> tuple[tuple[int, int, int, int], ...]:
+        """Build a hashable key from an item list for plan caching."""
+        return tuple((item["area"].value, item.get("db_number", 0), item["start"], item["size"]) for item in items)
+
     def _read_multi_optimized(self, items: List[dict[str, Any]]) -> List[bytearray]:
         """Run the optimized multi-read pipeline on a list of item dicts.
+
+        The optimization plan (sort → merge → packetize) is cached and
+        reused as long as the item list does not change.  Only the network
+        I/O and result extraction run on every call.
 
         Optimizable areas (PE, PA, MK, DB) are merged and packed into
         multi-item S7 requests.  CT/TM items fall back to individual
         ``read_area()`` calls.  Results are returned in input order.
         """
-        # Separate optimizable vs non-optimizable items
-        optimizable: List[Tuple[int, dict[str, Any]]] = []
-        fallback: List[Tuple[int, dict[str, Any]]] = []
+        cache_key = self._items_cache_key(items)
 
-        for idx, item in enumerate(items):
-            area: Area = item["area"]
-            if area in (Area.CT, Area.TM):
-                fallback.append((idx, item))
-            else:
-                optimizable.append((idx, item))
+        # Rebuild plan only when items change
+        if cache_key != self._opt_cache_key:
+            optimizable: List[Tuple[int, dict[str, Any]]] = []
+            fallback: List[Tuple[int, dict[str, Any]]] = []
+            for idx, item in enumerate(items):
+                area: Area = item["area"]
+                if area in (Area.CT, Area.TM):
+                    fallback.append((idx, item))
+                else:
+                    optimizable.append((idx, item))
+
+            read_items: List[ReadItem] = []
+            packets: List[Any] = []
+            if optimizable:
+                read_items = [
+                    ReadItem(
+                        area=item["area"],
+                        db_number=item.get("db_number", 0),
+                        byte_offset=item["start"],
+                        bit_offset=0,
+                        byte_length=item["size"],
+                        index=orig_idx,
+                    )
+                    for orig_idx, item in optimizable
+                ]
+                packets = optimize_reads(read_items, self.pdu_length)
+
+            self._opt_cache_key = cache_key
+            self._opt_cache_packets = packets
+            self._opt_cache_read_items = read_items
+            self._opt_cache_optimizable = optimizable
+            self._opt_cache_fallback = fallback
+            logger.debug(f"Optimization plan built: {len(packets)} packet(s) for {len(items)} item(s)")
+
+        # Use cached plan
+        packets = self._opt_cache_packets or []
+        read_items = self._opt_cache_read_items or []
+        optimizable = self._opt_cache_optimizable or []
+        fallback = self._opt_cache_fallback or []
 
         results: List[Tuple[int, bytearray]] = []
 
         # --- Optimized path for PE/PA/MK/DB ---
-        if optimizable:
-            read_items = [
-                ReadItem(
-                    area=item["area"],
-                    db_number=item.get("db_number", 0),
-                    byte_offset=item["start"],
-                    bit_offset=0,
-                    byte_length=item["size"],
-                    index=orig_idx,
-                )
-                for orig_idx, item in optimizable
-            ]
-
-            packets = optimize_reads(read_items, self.pdu_length)
-
-            all_blocks: List[ReadBlock] = []
-            for packet in packets:
+        if packets:
+            # Build PDU requests (sequence numbers must be fresh each cycle)
+            tagged_requests: List[Tuple[int, bytes]] = []
+            for i, packet in enumerate(packets):
                 request_items = [
                     (self._map_area(block.area), block.db_number, block.start_offset, block.byte_length)
                     for block in packet.blocks
                 ]
-                request = self.protocol.build_multi_read_request(request_items)
-                response = self._send_receive(request)
-                block_data = self.protocol.extract_multi_read_data(response, len(packet.blocks))
+                tagged_requests.append((i, self.protocol.build_multi_read_request(request_items)))
 
+            # Dispatch in sliding windows of max_parallel
+            all_responses: dict[int, dict[str, Any]] = {}
+            if len(tagged_requests) == 1:
+                conn = self._get_connection()
+                conn.send_data(tagged_requests[0][1])
+                response_data = conn.receive_data()
+                all_responses[0] = self.protocol.parse_response(response_data)
+            else:
+                for win_start in range(0, len(tagged_requests), self.max_parallel):
+                    window = tagged_requests[win_start : win_start + self.max_parallel]
+                    all_responses.update(self._send_receive_parallel(window))
+
+            # Extract data in packet order
+            all_blocks: List[ReadBlock] = []
+            for i, packet in enumerate(packets):
+                response = all_responses[i]
+                block_data = self.protocol.extract_multi_read_data(response, len(packet.blocks))
                 for block, data in zip(packet.blocks, block_data):
                     block.buffer = data
                     all_blocks.append(block)

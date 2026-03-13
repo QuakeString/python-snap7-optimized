@@ -758,9 +758,14 @@ class Server:
 
             header = struct.pack(
                 ">BBHHHHBB",
-                0x32, S7PDUType.ACK_DATA, 0x0000,
-                request["sequence"], 0x0002, data_len,
-                0x00, 0x00,
+                0x32,
+                S7PDUType.ACK_DATA,
+                0x0000,
+                request["sequence"],
+                0x0002,
+                data_len,
+                0x00,
+                0x00,
             )
             parameters = struct.pack(">BB", S7Function.READ_AREA, 0x01)
             data_section = struct.pack(">BBH", 0xFF, 0x04, len(read_data) * 8) + read_data
@@ -786,9 +791,7 @@ class Server:
             logger.error(f"Error handling read request: {e}")
             return self._build_error_response(request, 0x8000)
 
-    def _handle_multi_read_area(
-        self, request: Dict[str, Any], address_specs: List[Dict[str, Any]], item_count: int
-    ) -> bytes:
+    def _handle_multi_read_area(self, request: Dict[str, Any], address_specs: List[Dict[str, Any]], item_count: int) -> bytes:
         """Handle multi-item read area request."""
         data_section = bytearray()
 
@@ -822,9 +825,14 @@ class Server:
 
         header = struct.pack(
             ">BBHHHHBB",
-            0x32, S7PDUType.ACK_DATA, 0x0000,
-            request["sequence"], 0x0002, len(data_section),
-            0x00, 0x00,
+            0x32,
+            S7PDUType.ACK_DATA,
+            0x0000,
+            request["sequence"],
+            0x0002,
+            len(data_section),
+            0x00,
+            0x00,
         )
         parameters = struct.pack(">BB", S7Function.READ_AREA, item_count)
 
