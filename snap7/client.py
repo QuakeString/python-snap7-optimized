@@ -219,8 +219,8 @@ class Client:
     # Smaller PDUs indicate older/smaller PLCs with fewer resources.
     _PDU_PARALLEL_MAP = [
         (960, 8),  # S7-1500, S7-1200 high — full parallelism
-        (480, 6),  # S7-400, S7-1200 default
-        (240, 2),  # S7-300, LOGO, S7-200 — conservative
+        (480, 4),  # S7-400, S7-1200 default
+        (240, 1),  # S7-300, LOGO, S7-200 — sequential only (resets on parallel)
     ]
 
     def _auto_tune_parallel(self) -> None:
