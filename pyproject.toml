@@ -3,9 +3,9 @@ requires = ["setuptools>=68.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "python-snap7"
+name = "python-snap7-optimized"
 version = "3.0.0"
-description = "Pure Python S7 communication library for Siemens PLCs"
+description = "Pure Python S7 communication library for Siemens PLCs with read optimization pipeline"
 readme = "README.rst"
 authors = [
     {name = "Gijs Molenaar", email = "gijsmolenaar@gmail.com"},
@@ -28,7 +28,7 @@ requires-python = ">=3.10"
 keywords = ["snap7", "s7", "siemens", "plc"]
 
 [project.urls]
-Homepage = "https://github.com/gijzelaerr/python-snap7"
+Homepage = "https://github.com/QuakeString/python-snap7-optimized"
 Documentation = "https://python-snap7.readthedocs.io/en/latest/"
 
 [project.optional-dependencies]
