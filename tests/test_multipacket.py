@@ -10,7 +10,8 @@ from typing import Any, Dict
 
 import pytest
 
-from snap7.s7protocol import S7Protocol, S7UserDataGroup, S7UserDataSubfunction
+from snap7.s7protocol import S7Protocol, S7PDUType, S7Function, S7UserDataGroup, S7UserDataSubfunction
+from snap7.datatypes import S7Area, S7WordLen
 from snap7.error import (
     S7_PROTOCOL_ERROR_CODES,
     S7ProtocolError,
@@ -441,3 +442,187 @@ class TestTPDUSize:
         conn = ISOTCPConnection("127.0.0.1", tpdu_size=TPDUSize.S_2048)
         cr_pdu = conn._build_cotp_cr()
         assert cr_pdu[-3:] == bytes([0xC0, 0x01, TPDUSize.S_2048])
+
+
+# -----------------------------------------------------------------------
+# Multi-item read request/response tests
+# -----------------------------------------------------------------------
+
+
+@pytest.mark.client
+class TestBuildMultiReadRequest:
+    """Test build_multi_read_request PDU construction."""
+
+    def setup_method(self) -> None:
+        self.protocol = S7Protocol()
+
+    def test_single_item(self) -> None:
+        """Single-item multi-read should produce valid PDU."""
+        pdu = self.protocol.build_multi_read_request([(S7Area.DB, 1, 0, 4)])
+
+        # Request header: BBHHHH = 10 bytes
+        assert pdu[0] == 0x32  # Protocol ID
+        assert pdu[1] == S7PDUType.REQUEST
+
+        # Param length = 2 + 1*12 = 14  (at offset 6)
+        param_len = struct.unpack(">H", pdu[6:8])[0]
+        assert param_len == 14
+
+        # Data length = 0  (at offset 8)
+        data_len = struct.unpack(">H", pdu[8:10])[0]
+        assert data_len == 0
+
+        # Function code and item count (at offset 10)
+        assert pdu[10] == S7Function.READ_AREA
+        assert pdu[11] == 1  # item count
+
+    def test_multiple_items(self) -> None:
+        """Multi-item request should pack N address specs."""
+        items = [
+            (S7Area.DB, 1, 0, 4),
+            (S7Area.DB, 1, 10, 8),
+            (S7Area.MK, 0, 0, 2),
+        ]
+        pdu = self.protocol.build_multi_read_request(items)
+
+        param_len = struct.unpack(">H", pdu[6:8])[0]
+        assert param_len == 2 + 3 * 12  # 38
+
+        assert pdu[11] == 3  # item count
+
+        # Total PDU length: 10 (header) + 38 (params)
+        assert len(pdu) == 10 + 38
+
+    def test_address_spec_format(self) -> None:
+        """Address specs should use BYTE word length and correct encoding."""
+        pdu = self.protocol.build_multi_read_request([(S7Area.DB, 5, 10, 20)])
+
+        # Address spec starts at byte 12 (header=10, func+count=2)
+        addr = pdu[12:]
+        assert addr[0] == 0x12  # Spec type
+        assert addr[1] == 0x0A  # Length
+        assert addr[2] == 0x10  # Syntax ID
+        assert addr[3] == S7WordLen.BYTE  # Word length
+
+        # Count = 20
+        count = struct.unpack(">H", addr[4:6])[0]
+        assert count == 20
+
+        # DB number = 5
+        db_num = struct.unpack(">H", addr[6:8])[0]
+        assert db_num == 5
+
+        # Area = DB
+        assert addr[8] == S7Area.DB
+
+    def test_sequence_increments(self) -> None:
+        """Each call should increment the sequence number."""
+        pdu1 = self.protocol.build_multi_read_request([(S7Area.DB, 1, 0, 4)])
+        pdu2 = self.protocol.build_multi_read_request([(S7Area.DB, 1, 0, 4)])
+        seq1 = struct.unpack(">H", pdu1[4:6])[0]
+        seq2 = struct.unpack(">H", pdu2[4:6])[0]
+        assert seq2 == seq1 + 1
+
+
+@pytest.mark.client
+class TestExtractMultiReadData:
+    """Test extract_multi_read_data response parsing."""
+
+    def setup_method(self) -> None:
+        self.protocol = S7Protocol()
+
+    def _build_item(self, data: bytes, return_code: int = 0xFF, transport_size: int = 0x04) -> bytes:
+        """Build a single response data item."""
+        bit_length = len(data) * 8
+        return struct.pack(">BBH", return_code, transport_size, bit_length) + data
+
+    def test_single_item(self) -> None:
+        data_section = self._build_item(b"\x01\x02\x03\x04")
+        response: Dict[str, Any] = {"raw_data_section": data_section}
+        result = self.protocol.extract_multi_read_data(response, 1)
+        assert len(result) == 1
+        assert result[0] == bytearray(b"\x01\x02\x03\x04")
+
+    def test_multiple_items_even_length(self) -> None:
+        """Multiple items with even-length data — no fill bytes needed."""
+        item1 = self._build_item(b"\x01\x02\x03\x04")  # 4 bytes (even)
+        item2 = self._build_item(b"\x05\x06")  # 2 bytes (even)
+        response: Dict[str, Any] = {"raw_data_section": item1 + item2}
+        result = self.protocol.extract_multi_read_data(response, 2)
+        assert result[0] == bytearray(b"\x01\x02\x03\x04")
+        assert result[1] == bytearray(b"\x05\x06")
+
+    def test_fill_byte_between_items(self) -> None:
+        """Odd-length item should have a fill byte before the next item."""
+        item1_data = b"\x01\x02\x03"  # 3 bytes (odd)
+        item1 = self._build_item(item1_data)
+        fill = b"\x00"  # Fill byte
+        item2 = self._build_item(b"\x04\x05\x06\x07")
+        response: Dict[str, Any] = {"raw_data_section": item1 + fill + item2}
+        result = self.protocol.extract_multi_read_data(response, 2)
+        assert result[0] == bytearray(b"\x01\x02\x03")
+        assert result[1] == bytearray(b"\x04\x05\x06\x07")
+
+    def test_no_fill_after_last_item(self) -> None:
+        """Last item with odd length should NOT expect a fill byte."""
+        item1 = self._build_item(b"\x01\x02\x03\x04")  # even
+        item2 = self._build_item(b"\x05\x06\x07")  # odd, but last
+        response: Dict[str, Any] = {"raw_data_section": item1 + item2}
+        result = self.protocol.extract_multi_read_data(response, 2)
+        assert result[1] == bytearray(b"\x05\x06\x07")
+
+    def test_error_item_raises(self) -> None:
+        """Non-success return code should raise S7ProtocolError."""
+        data_section = self._build_item(b"", return_code=0x05)  # Invalid address
+        response: Dict[str, Any] = {"raw_data_section": data_section}
+        with pytest.raises(S7ProtocolError, match="Multi-read item 0 failed"):
+            self.protocol.extract_multi_read_data(response, 1)
+
+    def test_missing_raw_data_section(self) -> None:
+        with pytest.raises(S7ProtocolError, match="No raw data section"):
+            self.protocol.extract_multi_read_data({}, 1)
+
+    def test_three_items_mixed_fill(self) -> None:
+        """Three items: even, odd (fill), even."""
+        item1 = self._build_item(b"\x01\x02")  # 2 bytes, even
+        item2 = self._build_item(b"\x03\x04\x05")  # 3 bytes, odd
+        fill = b"\x00"
+        item3 = self._build_item(b"\x06\x07\x08\x09")  # 4 bytes, even
+        response: Dict[str, Any] = {"raw_data_section": item1 + item2 + fill + item3}
+        result = self.protocol.extract_multi_read_data(response, 3)
+        assert result[0] == bytearray(b"\x01\x02")
+        assert result[1] == bytearray(b"\x03\x04\x05")
+        assert result[2] == bytearray(b"\x06\x07\x08\x09")
+
+
+@pytest.mark.client
+class TestParseResponseRawDataSection:
+    """Test that parse_response preserves raw_data_section."""
+
+    def setup_method(self) -> None:
+        self.protocol = S7Protocol()
+
+    def test_raw_data_section_preserved(self) -> None:
+        """parse_response should store raw_data_section for multi-read use."""
+        # Build a minimal ACK_DATA response with data
+        data_section = struct.pack(">BBH", 0xFF, 0x04, 32) + b"\x01\x02\x03\x04"
+
+        # We need to set the sequence so it matches
+        self.protocol.sequence = 1
+        pdu = struct.pack(
+            ">BBHHHHBB",
+            0x32,  # Protocol ID
+            S7PDUType.ACK_DATA,
+            0x0000,  # Reserved
+            1,  # Sequence
+            0x0002,  # Param length
+            len(data_section),  # Data length
+            0x00,  # Error class
+            0x00,  # Error code
+        )
+        pdu += struct.pack(">BB", S7Function.READ_AREA, 0x01)  # Parameters
+        pdu += data_section
+
+        response = self.protocol.parse_response(pdu)
+        assert "raw_data_section" in response
+        assert response["raw_data_section"] == data_section

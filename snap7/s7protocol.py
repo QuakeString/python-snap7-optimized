@@ -173,6 +173,100 @@ class S7Protocol:
 
         return header + parameters
 
+    def build_multi_read_request(self, items: List[tuple[S7Area, int, int, int]]) -> bytes:
+        """Build S7 multi-item read request PDU.
+
+        Each item is ``(area, db_number, start, byte_count)``.  All items
+        are read as ``S7WordLen.BYTE``.
+
+        Args:
+            items: List of (area, db_number, start_byte, byte_count) tuples.
+
+        Returns:
+            Complete S7 PDU with N address specifications.
+        """
+        n = len(items)
+
+        # Build N × 12-byte address specifications
+        addr_specs = b""
+        for area, db_number, start, byte_count in items:
+            addr_specs += S7DataTypes.encode_address(area, db_number, start, S7WordLen.BYTE, byte_count)
+
+        # Parameter section: function(1) + item_count(1) + address_specs(N*12)
+        param_len = 2 + n * 12
+
+        header = struct.pack(
+            ">BBHHHH",
+            0x32,
+            S7PDUType.REQUEST,
+            0x0000,
+            self._next_sequence(),
+            param_len,
+            0x0000,  # No data for read requests
+        )
+
+        parameters = struct.pack(">BB", S7Function.READ_AREA, n) + addr_specs
+
+        return header + parameters
+
+    def extract_multi_read_data(self, response: "dict[str, Any]", expected_count: int) -> List[bytearray]:
+        """Extract data items from a multi-item read response.
+
+        The response data section contains *expected_count* items, each with:
+          - 1 byte return code (0xFF = success)
+          - 1 byte transport size
+          - 2 bytes data length in bits
+          - variable data bytes
+          - 1 fill byte if data byte-length is odd (NOT after last item)
+
+        Args:
+            response: Parsed S7 response (must contain ``raw_data_section``).
+            expected_count: Number of items expected in the response.
+
+        Returns:
+            List of bytearrays, one per item.
+
+        Raises:
+            S7ProtocolError: If an item has a non-success return code.
+        """
+        data_section = response.get("raw_data_section", b"")
+        if not data_section:
+            raise S7ProtocolError("No raw data section in response for multi-read")
+
+        results: List[bytearray] = []
+        offset = 0
+
+        for i in range(expected_count):
+            if offset + 4 > len(data_section):
+                raise S7ProtocolError(f"Multi-read response truncated at item {i}")
+
+            return_code = data_section[offset]
+            transport_size = data_section[offset + 1]
+            bit_length = struct.unpack(">H", data_section[offset + 2 : offset + 4])[0]
+            offset += 4
+
+            if return_code != 0xFF:
+                desc = get_return_code_description(return_code)
+                raise S7ProtocolError(f"Multi-read item {i} failed: {desc} (0x{return_code:02x})")
+
+            # Transport size 0x04 (byte data) uses bit length
+            if transport_size in (0x04, 0x05, 0x06, 0x07):
+                byte_length = bit_length // 8
+            else:
+                byte_length = bit_length
+
+            if offset + byte_length > len(data_section):
+                raise S7ProtocolError(f"Multi-read response data truncated at item {i}")
+
+            results.append(bytearray(data_section[offset : offset + byte_length]))
+            offset += byte_length
+
+            # Fill byte between items if byte_length is odd (not after last item)
+            if i < expected_count - 1 and byte_length % 2 == 1:
+                offset += 1  # Skip fill byte
+
+        return results
+
     def build_write_request(self, area: S7Area, db_number: int, start: int, word_len: S7WordLen, data: bytes) -> bytes:
         """
         Build S7 write request PDU.
@@ -1334,6 +1428,7 @@ class S7Protocol:
                 raise S7ProtocolError("Data section extends beyond PDU")
 
             data_section = pdu[offset : offset + data_len]
+            response["raw_data_section"] = data_section  # Preserved for multi-read parsing
             response["data"] = self._parse_data_section(data_section)
 
         return response

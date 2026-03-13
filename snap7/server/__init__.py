@@ -734,65 +734,46 @@ class Server:
         return header + parameters
 
     def _handle_read_area(self, request: Dict[str, Any], client_address: Tuple[str, int]) -> bytes:
-        """Handle read area request."""
+        """Handle read area request (single-item and multi-item)."""
         try:
-            # Parse address specification from request parameters
+            params = request.get("parameters", {})
+            item_count = params.get("item_count", 1)
+            address_specs = params.get("address_specs")
+
+            # Multi-item path
+            if item_count > 1 and address_specs:
+                return self._handle_multi_read_area(request, address_specs, item_count)
+
+            # Single-item path (original behaviour)
             addr_info = self._parse_read_address(request)
             if not addr_info:
-                return self._build_error_response(request, 0x8001)  # Invalid address
+                return self._build_error_response(request, 0x8001)
 
             area, db_number, start, count = addr_info
-
-            # Read data from registered memory area
             read_data = self._read_from_memory_area(area, db_number, start, count)
             if read_data is None:
-                return self._build_error_response(request, 0x8404)  # Area not found
+                return self._build_error_response(request, 0x8404)
 
-            # Calculate data length - need to include transport header + data
-            data_len = 4 + len(read_data)  # Transport header (4 bytes) + data
+            data_len = 4 + len(read_data)
 
-            # Build successful response
-            # S7 response header includes error class + error code
             header = struct.pack(
                 ">BBHHHHBB",
-                0x32,  # Protocol ID
-                S7PDUType.ACK_DATA,  # PDU type
-                0x0000,  # Reserved
-                request["sequence"],  # Sequence (echo)
-                0x0002,  # Parameter length
-                data_len,  # Data length
-                0x00,  # Error class (success)
-                0x00,  # Error code (success)
+                0x32, S7PDUType.ACK_DATA, 0x0000,
+                request["sequence"], 0x0002, data_len,
+                0x00, 0x00,
             )
+            parameters = struct.pack(">BB", S7Function.READ_AREA, 0x01)
+            data_section = struct.pack(">BBH", 0xFF, 0x04, len(read_data) * 8) + read_data
 
-            # Parameters
-            parameters = struct.pack(
-                ">BB",
-                S7Function.READ_AREA,  # Function code
-                0x01,  # Item count
-            )
-
-            # Data section
-            data_section = (
-                struct.pack(
-                    ">BBH",
-                    0xFF,  # Return code (success)
-                    0x04,  # Transport size (04 = byte data)
-                    len(read_data) * 8,  # Data length in bits
-                )
-                + read_data
-            )
-
-            # Trigger read event callback
             if self.read_callback:
                 event = SrvEvent()
                 event.EvtTime = int(time.time())
                 event.EvtSender = 0
-                event.EvtCode = 0x00004000  # Read event
+                event.EvtCode = 0x00004000
                 event.EvtRetCode = 0
-                event.EvtParam1 = 1  # Area
-                event.EvtParam2 = 0  # Offset
-                event.EvtParam3 = len(read_data)  # Size
+                event.EvtParam1 = 1
+                event.EvtParam2 = 0
+                event.EvtParam3 = len(read_data)
                 event.EvtParam4 = 0
                 try:
                     self.read_callback(event)
@@ -804,6 +785,50 @@ class Server:
         except Exception as e:
             logger.error(f"Error handling read request: {e}")
             return self._build_error_response(request, 0x8000)
+
+    def _handle_multi_read_area(
+        self, request: Dict[str, Any], address_specs: List[Dict[str, Any]], item_count: int
+    ) -> bytes:
+        """Handle multi-item read area request."""
+        data_section = bytearray()
+
+        for i, spec in enumerate(address_specs):
+            area = spec.get("area", S7Area.DB)
+            db_number = spec.get("db_number", 0)
+            start = spec.get("start", 0)
+            count = spec.get("count", 0)
+            word_len = spec.get("word_len", S7WordLen.BYTE)
+
+            # Convert count to bytes
+            if word_len in (S7WordLen.TIMER, S7WordLen.COUNTER, S7WordLen.WORD):
+                byte_count = count * 2
+            elif word_len in (S7WordLen.DWORD, S7WordLen.REAL):
+                byte_count = count * 4
+            elif word_len == S7WordLen.BIT:
+                byte_count = 1
+            else:
+                byte_count = count
+
+            read_data = self._read_from_memory_area(area, db_number, start, byte_count)
+            if read_data is None:
+                # Item-level error: object does not exist
+                data_section.extend(struct.pack(">BBH", 0x0A, 0x00, 0x0000))
+            else:
+                data_section.extend(struct.pack(">BBH", 0xFF, 0x04, len(read_data) * 8))
+                data_section.extend(read_data)
+                # Fill byte between items if data length is odd (not after last)
+                if i < item_count - 1 and len(read_data) % 2 == 1:
+                    data_section.append(0x00)
+
+        header = struct.pack(
+            ">BBHHHHBB",
+            0x32, S7PDUType.ACK_DATA, 0x0000,
+            request["sequence"], 0x0002, len(data_section),
+            0x00, 0x00,
+        )
+        parameters = struct.pack(">BB", S7Function.READ_AREA, item_count)
+
+        return header + parameters + data_section
 
     def _parse_read_address(self, request: Dict[str, Any]) -> Optional[Tuple[S7Area, int, int, int]]:
         """
@@ -1182,16 +1207,31 @@ class Server:
         elif function_code == S7Function.READ_AREA:
             # Parse read area parameters
             if len(param_data) >= 14:  # Minimum for read area request
-                # Function code (1) + item count (1) + address spec (12)
+                # Function code (1) + item count (1) + address spec(s) (N*12)
                 item_count = param_data[1]
 
-                # Parse address specification starting at byte 2
-                if len(param_data) >= 14:
-                    addr_spec = param_data[2:14]  # 12 bytes of address specification
-                    logger.debug(f"Extracted address spec from params: {addr_spec.hex()}")
-                    parsed_addr = self._parse_address_specification(addr_spec)
+                # Parse first address specification (backward compat)
+                addr_spec = param_data[2:14]
+                logger.debug(f"Extracted address spec from params: {addr_spec.hex()}")
+                parsed_addr = self._parse_address_specification(addr_spec)
 
-                    return {"function_code": function_code, "item_count": item_count, "address_spec": parsed_addr}
+                result: Dict[str, Any] = {
+                    "function_code": function_code,
+                    "item_count": item_count,
+                    "address_spec": parsed_addr,
+                }
+
+                # Parse all N address specs for multi-item reads
+                if item_count > 1:
+                    all_specs = []
+                    for i in range(item_count):
+                        spec_offset = 2 + i * 12
+                        if spec_offset + 12 <= len(param_data):
+                            spec = self._parse_address_specification(param_data[spec_offset : spec_offset + 12])
+                            all_specs.append(spec)
+                    result["address_specs"] = all_specs
+
+                return result
         elif function_code == S7Function.WRITE_AREA:
             # Parse write area parameters (same format as read)
             if len(param_data) >= 14:  # Minimum for write area request

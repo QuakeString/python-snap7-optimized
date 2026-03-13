@@ -19,6 +19,7 @@ from .connection import ISOTCPConnection
 from .s7protocol import S7Protocol, get_return_code_description
 from .datatypes import S7Area, S7WordLen
 from .error import S7Error, S7ConnectionError, S7ProtocolError, S7StalePacketError
+from .optimizer import ReadItem, ReadBlock, optimize_reads, extract_results
 
 from .type import (
     Area,
@@ -449,6 +450,10 @@ class Client:
         """
         Read multiple variables in a single request.
 
+        Uses an optimized pipeline that sorts, merges contiguous/nearby
+        addresses, and packs them into minimal PDU-sized multi-item S7
+        requests.  CT/TM areas fall back to individual reads.
+
         Args:
             items: List of item specifications or S7DataItem array
 
@@ -466,34 +471,84 @@ class Client:
 
         # Handle S7DataItem array (ctypes)
         if hasattr(items, "_type_") and hasattr(items[0], "Area"):
-            # This is a ctypes array of S7DataItem - use cast for type safety
             s7_items = cast("Array[S7DataItem]", items)
-            for s7_item in s7_items:
-                area = Area(s7_item.Area)
-                db_number = s7_item.DBNumber
-                start = s7_item.Start
-                size = s7_item.Amount
-                data = self.read_area(area, db_number, start, size)
-
-                # Copy data to pData buffer
+            optimized_data = self._read_multi_optimized([
+                {"area": Area(si.Area), "db_number": si.DBNumber, "start": si.Start, "size": si.Amount}
+                for si in s7_items
+            ])
+            for s7_item, data in zip(s7_items, optimized_data):
                 if s7_item.pData:
                     for i, b in enumerate(data):
                         s7_item.pData[i] = b
-
             return (0, items)
 
         # Handle dict list
         dict_items = cast(List[dict[str, Any]], items)
-        results = []
-        for dict_item in dict_items:
-            area = dict_item["area"]
-            db_number = dict_item.get("db_number", 0)
-            start = dict_item["start"]
-            size = dict_item["size"]
-            data = self.read_area(area, db_number, start, size)
-            results.append(data)
-
+        results = self._read_multi_optimized(dict_items)
         return (0, results)
+
+    def _read_multi_optimized(self, items: List[dict[str, Any]]) -> List[bytearray]:
+        """Run the optimized multi-read pipeline on a list of item dicts.
+
+        Optimizable areas (PE, PA, MK, DB) are merged and packed into
+        multi-item S7 requests.  CT/TM items fall back to individual
+        ``read_area()`` calls.  Results are returned in input order.
+        """
+        # Separate optimizable vs non-optimizable items
+        optimizable: List[Tuple[int, dict[str, Any]]] = []
+        fallback: List[Tuple[int, dict[str, Any]]] = []
+
+        for idx, item in enumerate(items):
+            area: Area = item["area"]
+            if area in (Area.CT, Area.TM):
+                fallback.append((idx, item))
+            else:
+                optimizable.append((idx, item))
+
+        results: List[Tuple[int, bytearray]] = []
+
+        # --- Optimized path for PE/PA/MK/DB ---
+        if optimizable:
+            read_items = [
+                ReadItem(
+                    area=item["area"],
+                    db_number=item.get("db_number", 0),
+                    byte_offset=item["start"],
+                    bit_offset=0,
+                    byte_length=item["size"],
+                    index=orig_idx,
+                )
+                for orig_idx, item in optimizable
+            ]
+
+            packets = optimize_reads(read_items, self.pdu_length)
+
+            all_blocks: List[ReadBlock] = []
+            for packet in packets:
+                request_items = [
+                    (self._map_area(block.area), block.db_number, block.start_offset, block.byte_length)
+                    for block in packet.blocks
+                ]
+                request = self.protocol.build_multi_read_request(request_items)
+                response = self._send_receive(request)
+                block_data = self.protocol.extract_multi_read_data(response, len(packet.blocks))
+
+                for block, data in zip(packet.blocks, block_data):
+                    block.buffer = data
+                    all_blocks.append(block)
+
+            extracted = extract_results(read_items, all_blocks)
+            for (orig_idx, _), data in zip(optimizable, extracted):
+                results.append((orig_idx, data))
+
+        # --- Fallback for CT/TM ---
+        for orig_idx, item in fallback:
+            data = self.read_area(item["area"], item.get("db_number", 0), item["start"], item["size"])
+            results.append((orig_idx, data))
+
+        # Return in original order
+        results.sort(key=lambda x: x[0])
+        return [data for _, data in results]
 
     def write_multi_vars(self, items: Union[List[dict[str, Any]], List[S7DataItem]]) -> int:
         """

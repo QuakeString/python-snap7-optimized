@@ -936,6 +936,120 @@ class TestClient(unittest.TestCase):
 
 
 @pytest.mark.client
+class TestReadMultiVarsOptimized(unittest.TestCase):
+    """Integration tests verifying read_multi_vars uses the optimization pipeline."""
+
+    server: Server = None  # type: ignore
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.server = Server()
+        db1_data = bytearray(range(256)) * 3
+        cls.server.register_area(SrvArea.DB, 1, db1_data[:600])
+        db2_data = bytearray(b"\xAA\xBB\xCC\xDD" * 150)
+        cls.server.register_area(SrvArea.DB, 2, db2_data[:600])
+        mk_data = bytearray(b"\x11\x22\x33\x44" * 25)
+        cls.server.register_area(SrvArea.MK, 0, mk_data[:100])
+        cls.server.register_area(SrvArea.CT, 0, bytearray(100))
+        cls.server.register_area(SrvArea.TM, 0, bytearray(100))
+        cls.server.start(tcp_port=tcpport + 1)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        if cls.server:
+            cls.server.stop()
+            cls.server.destroy()
+
+    def setUp(self) -> None:
+        self.client = Client()
+        self.client.connect(ip, rack, slot, tcpport + 1)
+
+    def tearDown(self) -> None:
+        self.client.disconnect()
+        self.client.destroy()
+
+    def test_single_item(self) -> None:
+        """Single-item read_multi_vars should match db_read."""
+        expected = self.client.db_read(1, 0, 4)
+        _, results = self.client.read_multi_vars([
+            {"area": Area.DB, "db_number": 1, "start": 0, "size": 4},
+        ])
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0], expected)
+
+    def test_multiple_same_db(self) -> None:
+        """Multiple items from the same DB."""
+        items = [
+            {"area": Area.DB, "db_number": 1, "start": 0, "size": 4},
+            {"area": Area.DB, "db_number": 1, "start": 10, "size": 8},
+            {"area": Area.DB, "db_number": 1, "start": 100, "size": 4},
+        ]
+        _, results = self.client.read_multi_vars(items)
+
+        self.assertEqual(len(results), 3)
+        self.assertEqual(results[0], self.client.db_read(1, 0, 4))
+        self.assertEqual(results[1], self.client.db_read(1, 10, 8))
+        self.assertEqual(results[2], self.client.db_read(1, 100, 4))
+
+    def test_multiple_dbs(self) -> None:
+        """Items across different DBs."""
+        items = [
+            {"area": Area.DB, "db_number": 1, "start": 0, "size": 4},
+            {"area": Area.DB, "db_number": 2, "start": 0, "size": 4},
+        ]
+        _, results = self.client.read_multi_vars(items)
+
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0], self.client.db_read(1, 0, 4))
+        self.assertEqual(results[1], self.client.db_read(2, 0, 4))
+
+    def test_empty_list(self) -> None:
+        """Empty list should return empty tuple."""
+        result = self.client.read_multi_vars([])
+        self.assertEqual(result, (0, []))
+
+    def test_ct_tm_fallback(self) -> None:
+        """CT and TM areas should fall back to individual reads (not error)."""
+        _, results = self.client.read_multi_vars([
+            {"area": Area.CT, "db_number": 0, "start": 0, "size": 2},
+        ])
+        self.assertEqual(len(results), 1)
+        self.assertEqual(len(results[0]), 4)  # CT reads return 2-byte words
+
+    def test_mk_area(self) -> None:
+        """Reading from MK area should work."""
+        _, results = self.client.read_multi_vars([
+            {"area": Area.MK, "db_number": 0, "start": 0, "size": 4},
+        ])
+        self.assertEqual(len(results), 1)
+        self.assertEqual(len(results[0]), 4)
+
+    def test_result_order_preserved(self) -> None:
+        """Results must be returned in the same order as input items."""
+        items = [
+            {"area": Area.DB, "db_number": 1, "start": 50, "size": 4},
+            {"area": Area.DB, "db_number": 1, "start": 10, "size": 4},
+            {"area": Area.DB, "db_number": 1, "start": 0, "size": 4},
+        ]
+        _, results = self.client.read_multi_vars(items)
+        self.assertEqual(results[0], self.client.db_read(1, 50, 4))
+        self.assertEqual(results[1], self.client.db_read(1, 10, 4))
+        self.assertEqual(results[2], self.client.db_read(1, 0, 4))
+
+    def test_contiguous_items_merged(self) -> None:
+        """Contiguous items should be merged into fewer network requests."""
+        items = [
+            {"area": Area.DB, "db_number": 1, "start": 0, "size": 4},
+            {"area": Area.DB, "db_number": 1, "start": 4, "size": 4},
+            {"area": Area.DB, "db_number": 1, "start": 8, "size": 4},
+        ]
+        _, results = self.client.read_multi_vars(items)
+        self.assertEqual(len(results), 3)
+        for i, item in enumerate(items):
+            self.assertEqual(results[i], self.client.db_read(1, item["start"], item["size"]))
+
+
+@pytest.mark.client
 class TestClientBeforeConnect(unittest.TestCase):
     """
     Test suite of items that should run without an open connection.
@@ -1173,7 +1287,12 @@ class TestMaxVars:
         client.connected = True
         mock_conn = MagicMock()
         client.connection = mock_conn
-        client.read_area = MagicMock(return_value=bytearray(1))
+
+        # Mock the internal send/receive to return one byte per block
+        client._send_receive = MagicMock(return_value={"raw_data_section": b"", "parameters": {"item_count": 1}})
+        client.protocol.extract_multi_read_data = MagicMock(
+            side_effect=lambda resp, count: [bytearray(1)] * count
+        )
 
         items = [{"area": Area.DB, "db_number": 1, "start": i, "size": 1} for i in range(20)]
         result_code, results = client.read_multi_vars(items)
