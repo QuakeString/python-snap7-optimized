@@ -32,7 +32,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: testpypi
-      url: https://test.pypi.org/p/python-snap7-optimized
+      url: https://test.pypi.org/p/snap7-optimized
     permissions:
       id-token: write
     steps:
@@ -71,5 +71,5 @@ jobs:
       - name: Install and test python-snap7
         run: |
           uv venv
-          uv pip install --index-strategy unsafe-best-match --extra-index-url https://test.pypi.org/simple/ python-snap7-optimized[test]
+          uv pip install --index-strategy unsafe-best-match --extra-index-url https://test.pypi.org/simple/ snap7-optimized[test]
           uv run python -c "import snap7; print('snap7 imported successfully')"
