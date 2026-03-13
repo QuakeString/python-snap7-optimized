@@ -1267,15 +1267,35 @@ class TestMaxVars:
     def test_max_vars_constant(self) -> None:
         assert Client.MAX_VARS == 20
 
-    def test_read_multi_vars_rejects_too_many(self) -> None:
+    def test_read_multi_vars_no_item_limit(self) -> None:
+        """read_multi_vars should accept any number of items (pipeline handles packing)."""
         client = Client()
         client.connected = True
         mock_conn = MagicMock()
+        mock_conn.timeout = 5.0
         client.connection = mock_conn
 
-        items = [{"area": Area.DB, "db_number": 1, "start": i, "size": 1} for i in range(21)]
-        with pytest.raises(ValueError, match="Too many items.*21.*MAX_VARS.*20"):
-            client.read_multi_vars(items)
+        mock_conn.receive_data = MagicMock(return_value=b"\x00" * 20)
+        mock_conn.data_available = MagicMock(return_value=True)
+
+        sent_seqs: list[int] = []
+
+        def track_send(pdu: bytes) -> None:
+            sent_seqs.append(struct.unpack(">H", pdu[4:6])[0])
+
+        mock_conn.send_data = track_send
+        seq_iter = iter(lambda: sent_seqs.pop(0) if sent_seqs else 0, -1)
+
+        def mock_parse(data: bytes) -> dict[str, Any]:
+            return {"raw_data_section": b"", "parameters": {"item_count": 1}, "sequence": next(seq_iter)}
+
+        client.protocol.parse_response = mock_parse  # type: ignore[assignment]
+        client.protocol.extract_multi_read_data = MagicMock(side_effect=lambda resp, count: [bytearray(1)] * count)
+
+        items = [{"area": Area.DB, "db_number": 1, "start": i, "size": 1} for i in range(100)]
+        result_code, results = client.read_multi_vars(items)
+        assert result_code == 0
+        assert len(results) == 100
 
     def test_write_multi_vars_rejects_too_many(self) -> None:
         client = Client()
@@ -1287,26 +1307,40 @@ class TestMaxVars:
         with pytest.raises(ValueError, match="Too many items.*21.*MAX_VARS.*20"):
             client.write_multi_vars(items)
 
-    def test_read_multi_vars_accepts_max(self) -> None:
-        """20 items (the limit) should not raise."""
+    def test_read_multi_vars_large_batch(self) -> None:
+        """read_multi_vars should handle large batches via the optimization pipeline."""
         client = Client()
         client.connected = True
         mock_conn = MagicMock()
+        mock_conn.timeout = 5.0
         client.connection = mock_conn
 
-        # Mock connection-level send/receive and protocol parsing
         mock_conn.send_data = MagicMock()
         mock_conn.receive_data = MagicMock(return_value=b"\x00" * 20)
         mock_conn.data_available = MagicMock(return_value=True)
-        client.protocol.parse_response = MagicMock(
-            return_value={"raw_data_section": b"", "parameters": {"item_count": 1}, "sequence": 0}
-        )
-        client.protocol.extract_multi_read_data = MagicMock(side_effect=lambda resp, count: [bytearray(1)] * count)
 
-        items = [{"area": Area.DB, "db_number": 1, "start": i, "size": 1} for i in range(20)]
+        # Track sequence numbers from sent PDUs to echo them back
+        sent_seqs: list[int] = []
+        original_send = mock_conn.send_data
+
+        def track_send(pdu: bytes) -> None:
+            seq = struct.unpack(">H", pdu[4:6])[0]
+            sent_seqs.append(seq)
+            original_send(pdu)
+
+        mock_conn.send_data = track_send
+        seq_iter = iter(lambda: sent_seqs.pop(0) if sent_seqs else 0, -1)
+
+        def mock_parse(data: bytes) -> dict[str, Any]:
+            return {"raw_data_section": b"", "parameters": {"item_count": 1}, "sequence": next(seq_iter)}
+
+        client.protocol.parse_response = mock_parse  # type: ignore[assignment]
+        client.protocol.extract_multi_read_data = MagicMock(side_effect=lambda resp, count: [bytearray(4)] * count)
+
+        items = [{"area": Area.DB, "db_number": 1, "start": i * 4, "size": 4} for i in range(500)]
         result_code, results = client.read_multi_vars(items)
         assert result_code == 0
-        assert len(results) == 20
+        assert len(results) == 500
 
     def test_write_multi_vars_accepts_max(self) -> None:
         """20 items (the limit) should not raise."""

@@ -560,20 +560,18 @@ class Client:
         addresses, and packs them into minimal PDU-sized multi-item S7
         requests.  CT/TM areas fall back to individual reads.
 
+        There is no hard limit on the number of items — the optimization
+        pipeline automatically packs them into PDU-sized packets and
+        dispatches in parallel.
+
         Args:
             items: List of item specifications or S7DataItem array
 
         Returns:
             Tuple of (result, items with data)
-
-        Raises:
-            ValueError: If more than MAX_VARS items are requested
         """
         if not items:
             return (0, items)
-
-        if len(items) > self.MAX_VARS:
-            raise ValueError(f"Too many items: {len(items)} exceeds MAX_VARS ({self.MAX_VARS})")
 
         # Handle S7DataItem array (ctypes)
         if hasattr(items, "_type_") and hasattr(items[0], "Area"):
