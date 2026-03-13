@@ -237,7 +237,7 @@ class Client:
                 # Leave headroom: use at most half the PLC's connection
                 # slots for parallel reads (other clients may need slots).
                 self.max_parallel = max(1, min(max_conn // 2, 8))
-                logger.debug(f"Auto-tuned max_parallel={self.max_parallel} (PLC MaxConnections={max_conn})")
+                logger.info(f"Auto-tuned max_parallel={self.max_parallel} (PLC MaxConnections={max_conn})")
                 return
         except Exception:
             pass  # SZL not supported — fall back to PDU heuristic
@@ -250,7 +250,7 @@ class Client:
         else:
             self.max_parallel = 1  # Very small PDU — sequential only
 
-        logger.debug(f"Auto-tuned max_parallel={self.max_parallel} (PDU={self.pdu_length})")
+        logger.info(f"Auto-tuned max_parallel={self.max_parallel} (PDU={self.pdu_length})")
 
     def connect(self, address: str, rack: int, slot: int, tcp_port: int = 102) -> "Client":
         """
@@ -640,7 +640,7 @@ class Client:
             self._opt_cache_read_items = read_items
             self._opt_cache_optimizable = optimizable
             self._opt_cache_fallback = fallback
-            logger.debug(f"Optimization plan built: {len(packets)} packet(s) for {len(items)} item(s)")
+            logger.info(f"Optimization plan built: {len(packets)} packet(s) for {len(items)} item(s)")
 
         # Use cached plan
         packets = self._opt_cache_packets or []
