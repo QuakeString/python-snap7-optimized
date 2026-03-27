@@ -52,11 +52,89 @@ New modules:
 - Extended ``snap7/server/__init__.py`` — Server-side multi-item read support for testing.
 
 
+Parallel Packet Dispatch
+========================
+
+For PLCs that support it (S7-1200, S7-400, S7-1500), multiple optimized read
+packets are dispatched back-to-back on the single TCP connection. Responses are
+matched by S7 sequence number as they arrive, maximizing throughput.
+
+- Auto-tuned ``max_parallel`` based on PLC capabilities (CP info or PDU heuristic).
+- Stale-packet detection with automatic retry.
+- S7-300 / LOGO / S7-200 automatically fall back to sequential dispatch.
+
+
+Optimization Plan Caching
+=========================
+
+The optimization pipeline result (sort → merge → packetize) is cached across
+repeated ``read_multi_vars()`` calls with the same item list. This eliminates
+re-computation overhead during cyclic polling — only the first call pays the
+optimization cost; subsequent calls reuse the cached plan.
+
+
+TCP Keepalive for Fast Dead-Peer Detection
+==========================================
+
+All TCP connections enable ``SO_KEEPALIVE`` with aggressive probe settings:
+
+- **Linux**: ``TCP_KEEPIDLE=2s``, ``TCP_KEEPINTVL=1s``, ``TCP_KEEPCNT=2``
+  — detects dead connections within ~4 seconds.
+- **macOS**: ``TCP_KEEPALIVE=2s``.
+
+This catches network-level failures (cable pull, PLC power loss, OS crash)
+far faster than the default TCP timeout (typically 30–120 seconds), which is
+critical for industrial applications where data gaps must be minimized.
+
+
+Heartbeat Read for Redundant PLC Monitoring
+===========================================
+
+New ``Client.heartbeat_read(timeout_ms=500)`` method provides a lightweight
+liveness check designed for monitoring standby PLCs in redundant S7 systems
+(S7-300H, S7-400H, S7-1500R/H).
+
+.. code-block:: python
+
+    client = snap7.Client()
+    client.connect("192.168.1.11", 0, 1)
+
+    # Fast liveness check — reads 1 byte from M0
+    if client.heartbeat_read(timeout_ms=300):
+        print("Standby PLC is alive")
+    else:
+        print("Standby PLC is unreachable")
+
+- Reads 1 byte from Merker area (M0) — negligible PLC scan cycle impact.
+- Uses a short, independent timeout (default 500 ms) without affecting the
+  client's normal socket timeout.
+- Returns ``True`` / ``False`` — no exceptions on timeout or connection error.
+- Designed for background heartbeat threads monitoring the inactive CPU in
+  a dual-connection redundancy setup.
+
+
+Model-Specific Tuning
+=====================
+
+Read optimization respects PLC-specific limits:
+
+==============================  ==================  ===============
+PLC Model                       Max Read Block      Max Parallel
+==============================  ==================  ===============
+S7-200 / S7-200 Smart / LOGO   100 bytes           1 (sequential)
+S7-300                          200 bytes           1 (sequential)
+S7-400                          200 bytes           4
+S7-1200                         1000 bytes          8
+S7-1500                         1000 bytes          8
+==============================  ==================  ===============
+
+
 Installation
 ============
 
 Install using pip::
 
-   $ pip install python-snap7
+   $ pip install snap7-optimized
 
-No native libraries or platform-specific dependencies are required - python-snap7 is a pure Python package that works on all platforms.
+No native libraries or platform-specific dependencies are required - this is a
+pure Python package that works on all platforms (Linux, Windows, macOS).

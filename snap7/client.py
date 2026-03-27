@@ -5,6 +5,7 @@ Drop-in replacement for the ctypes-based client with native Python implementatio
 """
 
 import logging
+import socket
 import struct
 import time
 from typing import List, Any, Optional, Tuple, Union, Callable, cast
@@ -336,6 +337,38 @@ class Client:
         if not self.connected or self.connection is None:
             return False
         return self.connection.check_connection()
+
+    def heartbeat_read(self, timeout_ms: int = 500) -> bool:
+        """Fast liveness check — reads 1 byte from Merker area with short timeout.
+
+        Designed for redundant PLC heartbeat monitoring. Reads M0 (1 byte)
+        which has negligible impact on PLC scan cycle. Uses a short timeout
+        to detect dead connections quickly.
+
+        Args:
+            timeout_ms: Timeout in milliseconds for this single read (default 500ms).
+
+        Returns:
+            True if PLC responded, False if timeout/error occurred.
+        """
+        if not self.connected or self.connection is None:
+            return False
+
+        original_timeout = self.connection.socket.gettimeout() if self.connection.socket else None
+        try:
+            self.connection.socket.settimeout(timeout_ms / 1000.0)
+            self.read_area(Area.MK, 0, 0, 1)
+            return True
+        except (S7TimeoutError, S7ConnectionError, socket.timeout, socket.error, OSError):
+            return False
+        except Exception:
+            return False
+        finally:
+            if self.connection and self.connection.socket and original_timeout is not None:
+                try:
+                    self.connection.socket.settimeout(original_timeout)
+                except OSError:
+                    pass
 
     def db_read(self, db_number: int, start: int, size: int) -> bytearray:
         """

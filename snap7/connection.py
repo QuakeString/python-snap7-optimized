@@ -197,13 +197,25 @@ class ISOTCPConnection:
             raise S7ConnectionError(f"Receive failed: {e}")
 
     def _tcp_connect(self) -> None:
-        """Establish TCP connection."""
+        """Establish TCP connection with TCP keepalive for fast dead-peer detection."""
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket.settimeout(self.timeout)
 
         try:
             self.socket.connect((self.host, self.port))
-            logger.debug(f"TCP connected to {self.host}:{self.port}")
+
+            # Enable TCP keepalive for fast detection of dead connections.
+            # This catches network-level failures (cable pull, OS crash)
+            # within ~4 seconds instead of waiting for the default TCP timeout.
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            if hasattr(socket, 'TCP_KEEPIDLE'):  # Linux
+                self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 2)
+                self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 1)
+                self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 2)
+            elif hasattr(socket, 'TCP_KEEPALIVE'):  # macOS
+                self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, 2)
+
+            logger.debug(f"TCP connected to {self.host}:{self.port} (keepalive enabled)")
         except socket.error as e:
             raise S7ConnectionError(f"TCP connection failed: {e}")
 
