@@ -118,15 +118,15 @@ Model-Specific Tuning
 
 Read optimization respects PLC-specific limits:
 
-==============================  ==================  ===============
-PLC Model                       Max Read Block      Max Parallel
-==============================  ==================  ===============
-S7-200 / S7-200 Smart / LOGO   100 bytes           1 (sequential)
-S7-300                          200 bytes           1 (sequential)
-S7-400                          200 bytes           4
-S7-1200                         1000 bytes          8
-S7-1500                         1000 bytes          8
-==============================  ==================  ===============
+==================================  ================  ================
+PLC Model                           Max Read Block    Max Parallel
+==================================  ================  ================
+S7-200 / S7-200 Smart / LOGO        100 bytes         1 (sequential)
+S7-300                               200 bytes         1 (sequential)
+S7-400                               200 bytes         4
+S7-1200                              1000 bytes        8
+S7-1500                              1000 bytes        8
+==================================  ================  ================
 
 
 Installation
