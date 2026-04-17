@@ -351,12 +351,13 @@ class Client:
         Returns:
             True if PLC responded, False if timeout/error occurred.
         """
-        if not self.connected or self.connection is None:
+        if not self.connected or self.connection is None or self.connection.socket is None:
             return False
 
-        original_timeout = self.connection.socket.gettimeout() if self.connection.socket else None
+        sock = self.connection.socket
+        original_timeout = sock.gettimeout()
         try:
-            self.connection.socket.settimeout(timeout_ms / 1000.0)
+            sock.settimeout(timeout_ms / 1000.0)
             self.read_area(Area.MK, 0, 0, 1)
             return True
         except (S7TimeoutError, S7ConnectionError, socket.timeout, socket.error, OSError):
