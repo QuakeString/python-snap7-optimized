@@ -1284,40 +1284,93 @@ class S7Protocol:
         """
         Parse get clock response.
 
+        S7 USER_DATA GET_CLK returns the PLC's real-time clock as a
+        10-byte DATE_AND_TIME (DT) structure:
+
+            byte 0  : reserved
+            byte 1  : reserved / status
+            byte 2  : year          (BCD, 2 digits)
+            byte 3  : month         (BCD 01-12)
+            byte 4  : day           (BCD 01-31)
+            byte 5  : hour          (BCD 00-23)
+            byte 6  : minute        (BCD 00-59)
+            byte 7  : second        (BCD 00-59)
+            byte 8  : ms_high  (+  hundredths of second, BCD)
+            byte 9  : ms_low   + weekday (low nibble)
+
         Args:
-            response: Parsed S7 response
+            response: Parsed S7 response.
 
         Returns:
-            Datetime from PLC
+            Datetime from PLC.
+
+        Raises:
+            ValueError: if the response does not contain a valid clock
+                payload (e.g. the PLC answered with an error code, the
+                data was truncated, or BCD decoding failed).
+
+        Notes:
+            Earlier revisions returned ``datetime.now()`` as a silent
+            fallback here and in the caller wrapper. That made
+            ``get_plc_datetime()`` impossible to distinguish from a
+            successful read on CPUs that don't expose their clock
+            (e.g. S7-300 returning 0xd402 "information function
+            unavailable"). Callers expect an accurate PLC time or a
+            clear error; we now raise instead of inventing a value.
         """
         from datetime import datetime as dt_class
 
         data_info = response.get("data", {})
+        return_code = data_info.get("return_code")
         raw_data = data_info.get("data", b"")
 
-        if len(raw_data) < 8:
-            # Return current time if no valid data
-            return dt_class.now().replace(microsecond=0)
+        # 0xFF == success in S7 USER_DATA; anything else means the PLC
+        # declined the request (0xd402 "Information function unavailable",
+        # 0x8104 "Requested function not implemented", etc.).
+        if return_code is not None and return_code != 0xFF:
+            raise ValueError(
+                f"PLC returned USER_DATA error 0x{return_code:02x} for GET_CLK"
+            )
 
-        # Parse BCD time
+        if len(raw_data) < 8:
+            raise ValueError(
+                f"GET_CLK response too short ({len(raw_data)} bytes; need ≥ 8)"
+            )
+
         def from_bcd(value: int) -> int:
             return ((value >> 4) * 10) + (value & 0x0F)
 
-        # Skip first byte (reserved)
-        year = from_bcd(raw_data[1])
-        month = from_bcd(raw_data[2])
-        day = from_bcd(raw_data[3])
-        hour = from_bcd(raw_data[4])
-        minute = from_bcd(raw_data[5])
-        second = from_bcd(raw_data[6])
+        # The wire format has varied slightly across CPU families:
+        #   - Most S7-300/400/1200/1500 responses: year starts at byte 2
+        #     (bytes 0 and 1 are reserved / version markers).
+        #   - A few older/embedded variants: year starts at byte 1.
+        # Try both offsets and accept the one that yields a valid datetime
+        # whose year is plausible (1990..2099). This avoids guessing per
+        # CPU model while still refusing to invent garbage dates.
+        errors: list[str] = []
+        for offset in (2, 1):
+            if len(raw_data) < offset + 6:
+                errors.append(f"offset {offset}: truncated")
+                continue
+            try:
+                year = from_bcd(raw_data[offset])
+                month = from_bcd(raw_data[offset + 1])
+                day = from_bcd(raw_data[offset + 2])
+                hour = from_bcd(raw_data[offset + 3])
+                minute = from_bcd(raw_data[offset + 4])
+                second = from_bcd(raw_data[offset + 5])
+                full_year = 2000 + year if year < 90 else 1900 + year
+                dt = dt_class(full_year, month, day, hour, minute, second)
+                if 1990 <= full_year <= 2099:
+                    return dt
+                errors.append(f"offset {offset}: implausible year {full_year}")
+            except (IndexError, ValueError) as e:
+                errors.append(f"offset {offset}: {e}")
 
-        # Determine century (assume 2000s for years 0-99)
-        full_year = 2000 + year if year < 90 else 1900 + year
-
-        try:
-            return dt_class(full_year, month, day, hour, minute, second)
-        except ValueError:
-            return dt_class.now().replace(microsecond=0)
+        raise ValueError(
+            "Could not parse GET_CLK BCD payload at any known offset "
+            f"(bytes={raw_data.hex()}; attempts={errors})"
+        )
 
     def build_cpu_state_request(self) -> bytes:
         """
