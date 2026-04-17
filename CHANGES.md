@@ -1,6 +1,34 @@
 CHANGES
 =======
 
+3.1.1
+-----
+
+Bug fix release for PLC clock reads.
+
+* **Fix**: `get_plc_datetime()` / `parse_get_clock_response()` now reads the
+  year from byte offset 2 of the USER_DATA GET_CLK response (previously
+  byte 1, which is a reserved / version marker on S7-300, S7-400,
+  S7-1200 and S7-1500 CPUs). The old offset decoded garbage month
+  values on every real PLC, which then fell through to a silent
+  fallback.
+* **Fix**: Remove the silent `datetime.now()` fallback from the clock
+  parser. When the response is truncated, the PLC replies with an
+  error code (e.g. 0xd402 "Information function unavailable"), or BCD
+  decoding fails, the parser now raises `ValueError` with diagnostic
+  detail. Callers that previously trusted the returned datetime could
+  not distinguish a real clock read from fabricated host time.
+* The parser probes year offsets 2 and 1 and accepts the first that
+  yields a plausible year in 1990..2099, so firmware variants that
+  omit the version-marker byte still work.
+
+3.1.0
+-----
+
+* Feature: redundant PLC support for S7-300H/400H/1500R/H (automatic
+  failover between primary and standby CPUs with heartbeat monitoring).
+* Parallel dispatch for multi-PLC polling.
+
 3.0.0
 -----
 
