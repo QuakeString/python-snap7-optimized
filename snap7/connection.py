@@ -208,11 +208,11 @@ class ISOTCPConnection:
             # This catches network-level failures (cable pull, OS crash)
             # within ~4 seconds instead of waiting for the default TCP timeout.
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            if hasattr(socket, 'TCP_KEEPIDLE'):  # Linux
+            if hasattr(socket, "TCP_KEEPIDLE"):  # Linux
                 self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 2)
                 self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 1)
                 self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 2)
-            elif hasattr(socket, 'TCP_KEEPALIVE'):  # macOS
+            elif hasattr(socket, "TCP_KEEPALIVE"):  # macOS
                 self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, 2)
 
             logger.debug(f"TCP connected to {self.host}:{self.port} (keepalive enabled)")

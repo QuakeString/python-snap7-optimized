@@ -1328,14 +1328,10 @@ class S7Protocol:
         # declined the request (0xd402 "Information function unavailable",
         # 0x8104 "Requested function not implemented", etc.).
         if return_code is not None and return_code != 0xFF:
-            raise ValueError(
-                f"PLC returned USER_DATA error 0x{return_code:02x} for GET_CLK"
-            )
+            raise ValueError(f"PLC returned USER_DATA error 0x{return_code:02x} for GET_CLK")
 
         if len(raw_data) < 8:
-            raise ValueError(
-                f"GET_CLK response too short ({len(raw_data)} bytes; need ≥ 8)"
-            )
+            raise ValueError(f"GET_CLK response too short ({len(raw_data)} bytes; need ≥ 8)")
 
         def from_bcd(value: int) -> int:
             return ((value >> 4) * 10) + (value & 0x0F)
@@ -1367,10 +1363,7 @@ class S7Protocol:
             except (IndexError, ValueError) as e:
                 errors.append(f"offset {offset}: {e}")
 
-        raise ValueError(
-            "Could not parse GET_CLK BCD payload at any known offset "
-            f"(bytes={raw_data.hex()}; attempts={errors})"
-        )
+        raise ValueError(f"Could not parse GET_CLK BCD payload at any known offset (bytes={raw_data.hex()}; attempts={errors})")
 
     def build_cpu_state_request(self) -> bytes:
         """
